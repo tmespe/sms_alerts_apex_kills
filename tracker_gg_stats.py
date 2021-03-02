@@ -1,68 +1,109 @@
-import os
 import json
-from datetime import datetime
-from pprint import PrettyPrinter
+import os
+from dataclasses import dataclass
 
 import requests
-from apscheduler.schedulers.blocking import BlockingScheduler
-from apscheduler.triggers.interval import IntervalTrigger
+# from requests import HTTPError
 from dotenv import load_dotenv
 
-from main import send_message
+#
 
 # Initialize scheduler
-scheduler = BlockingScheduler()
+# scheduler = BlockingScheduler()
 load_dotenv()
 
 API_KEY = os.getenv("GG_TRACKERS_API_KEY")
 PHONES = str.split(os.getenv("PHONES"), ",")
 BASE_URL = "https://public-api.tracker.gg/apex/v1/standard/profile/"
 HEADERS = {"TRN-Api-Key": API_KEY}
+PLATFORMS = {"xbl": 1,
+             "psn": 2,
+             "pc": 5}
 
 with open("last_kills.json") as f:
     last_kills = json.load(f)
 
-def get_player_stats(platform, profile_name, segment_type=None):
-    """Gets stats for a given platform (PC, Xbox, PSN) for a given player profile name
 
+# Store kills with a legend for a given player
+@dataclass
+class PlayerLegend:
+    """ Class for storing data for a legend for a given player"""
+    player_name: str
+    legend_name: str
+    kills: int
+
+
+@dataclass
+class Player:
+    """CLass for storing player data for a given player """
+    player_name: str
+    platform: str
+    legends: list[PlayerLegend]
+    level: int = 0
+    season_rank: int = 0
+    total_kills: int = 0
+
+    def __str__(self):
+        return f"{self.player_name}({self.platform}) is a level {self.level} player with a current season rank of " \
+               f"{self.season_rank} and {self.total_kills} total kills"
+
+
+def get_player_stats(platform: str, profile_name: str):
+    """Gets stats for a given platform (PC, Xbox, PSN) for a given player
 
     Args:
-        platform (int): The platform of the profile (5 = pc, 1 = xbl, 2 = psn)
+        platform (str): The platform of the profile xbl,psn, pc
         profile_name (string): Profile name of player to get data for
     """
-    pp = PrettyPrinter(indent=4)
 
-    url = f"{BASE_URL}{platform}/{profile_name}"
+    # Get data from apextracker.gg for playername on platform. If unsuccessful print error and exit.
+    url = f"{BASE_URL}{PLATFORMS.get(platform)}/{profile_name}"
+    try:
+        response = requests.get(url, headers=HEADERS)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        if "Account not found" in response.text:
+            print(f"No account found for {profile_name} on {platform}. Please check username and/or platform")
+        raise ValueError(e)
 
-    # If segment type is selected use url for fetching segment data
-    if segment_type:
-        url = f"{url}/segments/{segment_type}"
-    # print(url)
-    r = requests.get(url, headers=HEADERS)
-    # Get json from api data
-    json_data = r.json()["data"]
+    # Get json from request object and check if valid
+    try:
+        json_data = response.json()["data"]
+        level = json_data["metadata"]["level"]
+        season_rank = json_data["metadata"]["rankName"]
+    except KeyError as e:
+        print("Account data is invalid")
+        raise
 
-    account_data = {
-        "profile_name": profile_name,
-        "level": json_data["metadata"]["level"],
-        "season_rank": json_data["metadata"]["rankName"],
-        "legend_data": [],
-    }
+    # Extract legend stats for all legends
+    legends = get_legend_stats(json_data, profile_name=profile_name)
+    # Calculate total kills with all legends
+    kills = sum(legend.kills for legend in legends)
 
-    # Get legend data from the children node of the json
-    legend_data = json_data["children"]
-    # Loop over legends and get stat key and stat value and save in dict
-    for legend in legend_data:
-        stats = {stat.get("metadata")["name"]: stat.get("displayValue") for stat in legend.get("stats")}
+    # Instantiate a new Player dataclass representing a player's stats
+    player = Player(player_name=profile_name, legends=legends, level=level, season_rank=season_rank,
+                    platform=platform.lower(), total_kills=kills)
 
-        legend_data = {
-            "legend": legend["metadata"]["legend_name"],
-            "stats": stats
-        }
-        account_data["legend_data"].append(legend_data)
+    print(player)
+    return player
 
-    # pp.pprint(account_data)
-    return account_data
+
+def get_legend_stats(json_data: json, profile_name: str):
+    """
+    Extract legend stats from apextracker.gg api and returns a list of PlayerLegend dataclass
+    :param json_data: apextracker.gg api result
+    :param profile_name: A player's profile name
+    :return: PlayerLegend dataclass (profile_name, legend_name, kills)
+    """
+    legends = []
+    for legend_data in json_data["children"]:
+        legend_name = legend_data["metadata"]["legend_name"]
+        try:
+            kills = legend_data["stats"][0].get("value")
+        except IndexError:
+            kills = 0
+        legends.append(PlayerLegend(profile_name, legend_name, kills))
+    return legends
 
 
 def check_100_kills(player_stats, legend_to_check):
@@ -86,35 +127,46 @@ def check_100_kills(player_stats, legend_to_check):
     return False
 
 
-def check_players():
-    magga = get_player_stats(2, "magnusnyquist")
-    chilhoss = get_player_stats(2, "chilhoss")
-    helibent = get_player_stats(2, "heli_bent")
+def get_players(**platform_player):
+    """
 
-    magga_100 = check_100_kills(magga, "gibraltar")
-    chilhoss_100 = check_100_kills(chilhoss, "horizon")
-    helibent_100 = check_100_kills(helibent, "pathfinder")
-
-    return magga_100, chilhoss_100, helibent_100
-
-
-@scheduler.scheduled_job(IntervalTrigger(minutes=1))
-def send_sms_100():
-    players = check_players()
-    player_kills = {
-        "magga": players[0],
-        "chilhoss": players[1],
-        #"chilhoss": 500,
-        "helibent": players[2],
-    }
-
-    for player, kills in player_kills.items():
-        if kills:
-            for num in PHONES:
-                send_message(num, f"Gratulerer {player} med {kills} kills!!!")
-                print("Sent message to", num)
-    print("Checked stats", datetime.now())
+    :params Platform_player: Player platform in the form of player1="xbl player_name", player2="psn player2_name"
+    :return: A list of the Player dataclass for all players
+    """
+    players = []
+    for player in platform_player.values():
+        try:
+            player = player.split(" ")
+            player_stats = get_player_stats(player[0], player[1])
+            players.append(player_stats)
+        except ValueError as e:
+            print(e)
+    # for player in platform_player.values():
+    #     player = player.split(" ")
+    #     get_player_stats(player[0], player[1])
+    return players
 
 
-#send_sms_100()
-scheduler.start()
+# @scheduler.scheduled_job(IntervalTrigger(minutes=1))
+# def send_sms_100():
+#     players = check_players()
+#     player_kills = {
+#         "magga": players[0],
+#         "chilhoss": players[1],
+#         #"chilhoss": 500,
+#         "helibent": players[2],
+#     }
+
+#     for player, kills in player_kills.items():
+#         if kills:
+#             for num in PHONES:
+#                 send_message(num, f"Gratulerer {player} med {kills} kills!!!")
+#                 print("Sent message to", num)
+#     print("Checked stats", datetime.now())
+
+
+# send_sms_100()
+# scheduler.start()
+
+# get_player_stats("psn", "heli_bent")
+get_players(player1="psn x", player2="psn magnusnyquist", player3="psn chilhoss")
